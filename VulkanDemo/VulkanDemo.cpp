@@ -5,6 +5,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -212,6 +215,12 @@ private:
     // 指令池对象
     // 用于管理指令缓冲对象使用的内存，并负责指令缓冲对象的分配
     VkCommandPool commandPool;
+
+    // 纹理图像
+    VkImage textureImage;
+    // 纹理图像内存
+    VkDeviceMemory textureImageMemory;
+
     // 顶点缓冲
     VkBuffer vertexBuffer;
     // 顶点缓冲内存
@@ -287,6 +296,7 @@ private:
         createGraphicsPipeline();   // 创建图形管线
         createFramebuffers();       // 创建帧缓冲
         createCommandPool();        // 创建命令池
+        createTextureImage();       // 创建纹理贴图
         createVertexBuffer();       // 创建顶点缓冲
         createIndexBuffer();        // 创建索引缓冲
         createUniformBuffers();     // 创建统一缓冲
@@ -352,16 +362,18 @@ private:
         // 清除描述符池
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
+        // 清除纹理图像和内存
+        vkDestroyImage(device, textureImage, nullptr);
+        vkFreeMemory(device, textureImageMemory, nullptr);
+
         // 清除描述符布局
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
-        // 清除索引缓冲对象
+        // 清除索引缓冲对象和内存
         vkDestroyBuffer(device, indexBuffer, nullptr);
-        // 释放索引缓冲内存
         vkFreeMemory(device, indexBufferMemory, nullptr);
-        // 清除顶点缓冲对象
+        // 清除顶点缓冲对象和内存
         vkDestroyBuffer(device, vertexBuffer, nullptr);
-        // 释放顶点缓冲内存
         vkFreeMemory(device, vertexBufferMemory, nullptr);
 
         // 清除信号量和栅栏
@@ -975,6 +987,179 @@ private:
         }
     }
 
+    // 创建纹理贴图
+    void createTextureImage() 
+    {
+        int texWidth, texHeight, texChannels;
+        stbi_uc* pixels = stbi_load("Textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        // 每个像素由4个字节存储
+        VkDeviceSize imageSize = texWidth * texHeight * 4;
+
+        if (!pixels) 
+        {
+            throw std::runtime_error("failed to load texture image!");
+        }
+
+        // 临时缓冲
+        VkBuffer stagingBuffer;
+        // 临时缓冲内存
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        // 映射内存，将图像数据复制到临时缓冲区
+        vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+        memcpy(data, pixels, static_cast<size_t>(imageSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // 清除图像数据
+        stbi_image_free(pixels);
+
+        // 创建 vulkan 的图像对象
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+
+        // 图像布局变换
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // 复制缓冲到图像
+        copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        // 清除暂存缓冲和相关联的内存
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    // 创建 vulkan 的图像对象
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) 
+    {
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        // 指定图像类型(一维、二维、三维)
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = format;
+        imageInfo.tiling = tiling;
+        // 纹理在第一次变换后被丢失
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = usage;
+        // 用于设置多重采样
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        // 创建图像对象
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) 
+        {
+            throw std::runtime_error("failed to create image!");
+        }
+
+        // 获取图像对象的内存需求
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+        // 分配内存
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) 
+        {
+            throw std::runtime_error("failed to allocate image memory!");
+        }
+
+        // 将图像和内存进行关联
+        vkBindImageMemory(device, image, imageMemory, 0);
+    }
+
+    // 图像布局变换
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) 
+    {
+        // 记录和执行命令缓冲区
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // 图像内存屏障对象
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        // 这俩个用于指定布局变换
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+        // 不进行队列所有权传递
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        // 变换(过渡)屏障掩码
+        VkPipelineStageFlags sourceStage;
+        VkPipelineStageFlags destinationStage;
+
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+        {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) 
+        {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+        else 
+        {
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+
+        // 提交管线屏障对象
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            sourceStage, destinationStage,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrier
+        );
+
+        // 结束记录和执行命令缓冲区
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // 复制缓冲到图像
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) 
+    {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        // 指定复制的数据在缓冲中的偏移位置
+        region.bufferOffset = 0;
+        // 这两个变量用于指定数据在内存中的存放方式
+        // 都设置为0，数据将会在内存中被紧凑存放
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = {width, height, 1};
+
+        vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
     // 创建顶点缓冲
     void createVertexBuffer()
     {
@@ -1135,8 +1320,8 @@ private:
         vkBindBufferMemory(device, buffer, bufferMemory, 0);
     }
 
-    // 用于从一个缓冲区拷贝数据到另一个缓冲区
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+    // 记录和执行命令缓冲区
+    VkCommandBuffer beginSingleTimeCommands() 
     {
         // 分配一个临时命令缓冲区
         VkCommandBufferAllocateInfo allocInfo{};
@@ -1156,11 +1341,12 @@ private:
 
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-        VkBufferCopy copyRegion = {};
-        copyRegion.size = size;
-        // 进行缓冲的复制操作
-        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        return commandBuffer;
+    }
 
+    // 结束记录和执行命令缓冲区
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer)
+    {
         // 停止记录
         vkEndCommandBuffer(commandBuffer);
 
@@ -1175,6 +1361,21 @@ private:
 
         // 清除使用的命令缓冲对象
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    // 用于从一个缓冲区拷贝数据到另一个缓冲区
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+    {
+        // 记录和执行命令缓冲区
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferCopy copyRegion = {};
+        copyRegion.size = size;
+        // 进行缓冲的复制操作
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        // 结束记录和执行命令缓冲区
+        endSingleTimeCommands(commandBuffer);
     }
 
     // 选择最合适的内存类型使用
